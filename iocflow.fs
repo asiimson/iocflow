@@ -36,13 +36,35 @@ module Kinds =
               RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
 
     let validIpv4 (s: string) =
-        let m = reIpv4.Match(s)
-        if not m.Success then false
+        if String.IsNullOrWhiteSpace s then false
         else
-            [1..4]
-            |> List.forall (fun i ->
-                let mutable n = 0
-                Int32.TryParse(m.Groups.[i].Value, &n) && n >= 0 && n <= 255)
+            let m = reIpv4.Match(s.Trim())
+            if not m.Success then false
+            else
+                [1..4]
+                |> List.forall (fun i ->
+                    let mutable n = 0
+                    Int32.TryParse(m.Groups.[i].Value, &n) && n >= 0 && n <= 255)
+
+    /// Canonical dotted-quad form (strips leading zeros).
+    let canonicalIpv4 (s: string) : string option =
+        if String.IsNullOrWhiteSpace s then None
+        else
+            let v = s.Trim()
+            let m = reIpv4.Match(v)
+            if not m.Success then None
+            else
+                let parts =
+                    [1..4]
+                    |> List.map (fun i ->
+                        let mutable n = -1
+                        if Int32.TryParse(m.Groups.[i].Value, &n) && n >= 0 && n <= 255 then Some n
+                        else None)
+
+                match parts with
+                | [Some a; Some b; Some c; Some d] ->
+                    Some (sprintf "%d.%d.%d.%d" a b c d)
+                | _ -> None
 
     let isIpv4 (s: string) = validIpv4 s
 
@@ -80,12 +102,17 @@ module UrlUtil =
         | true, uri -> Some uri
         | _ -> None
 
+    /// Host without IPv6 brackets, lowercased. Suitable for enrichment lookups.
+    let private safeHost (uri: Uri) =
+        // DnsSafeHost strips IPv6 brackets; Trim is a defensive belt-and-braces.
+        uri.DnsSafeHost.Trim([|'['; ']'|]).ToLowerInvariant()
+
     let tryHost (u: string) : string option =
         match tryUri u with
         | Some uri when uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
                       || uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
                       || uri.Scheme.Equals("ftp", StringComparison.OrdinalIgnoreCase) ->
-            Some (uri.Host.ToLowerInvariant())
+            Some (safeHost uri)
         | _ -> None
 
     let canonical (raw: string) : string option =
@@ -97,8 +124,9 @@ module UrlUtil =
                 let scheme = uri.Scheme.ToLowerInvariant()
                 match scheme with
                 | "http" | "https" | "ftp" ->
-                    let host = uri.Host.ToLowerInvariant()
+                    let host = safeHost uri
                     let host =
+                        // Re-add brackets for IPv6 in the URL form.
                         if host.Contains ":" then "[" + host + "]" else host
 
                     let port =
@@ -171,9 +199,14 @@ module Normalize =
                 ":",
                 RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
 
+        // Only rewrite "hxxp"/"hxxps" when it is actually acting as a scheme,
+        // i.e. followed by "://". This prevents rewriting the token when it
+        // appears glued to a preceding word character (e.g. "myhxxp") or as
+        // part of an unrelated label (e.g. "hxxp.example.com", ".../hxxp").
+        // IgnoreCase makes an explicit (?:x|X) alternation unnecessary.
         Regex.Replace(
             x,
-            @"h(?:x|X){2}p(s?)",
+            @"\bhxxp(s?)(?=://)",
             "http$1",
             RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
 
@@ -184,13 +217,15 @@ module Normalize =
             let lower = v.ToLowerInvariant()
 
             match lower with
-            | "ipv4" | "ip" -> Some IPv4
+            // Explicit, unambiguous type names.
+            | "ipv4" -> Some IPv4
             | "ipv6" -> Some IPv6
             | "domain" -> Some Domain
             | "url" | "uri" -> Some Url
             | "md5" -> Some Md5
             | "sha1" | "sha-1" -> Some Sha1
-            | "sha256" | "sha-256" | "hash" -> Some Sha256
+            | "sha256" | "sha-256" -> Some Sha256
+            // Ambiguous aliases ("ip", "hash") fall through to value-based detection.
             | _ ->
                 if Kinds.reSha256.IsMatch v then Some Sha256
                 elif Kinds.reSha1.IsMatch v then Some Sha1
@@ -200,7 +235,8 @@ module Normalize =
                 elif lower.StartsWith("http://") ||
                      lower.StartsWith("https://") ||
                      lower.StartsWith("ftp://") then Some Url
-                elif Kinds.reDomain.IsMatch v then Some Domain
+                // Trim trailing dot before domain check.
+                elif Kinds.reDomain.IsMatch (v.TrimEnd('.')) then Some Domain
                 else None
 
     let private canonicalDomain (v: string) =
@@ -223,7 +259,9 @@ module Normalize =
 
             match selectedKind with
             | Some IPv4 ->
-                if Kinds.isIpv4 v then Some (v, IPv4) else None
+                match Kinds.canonicalIpv4 v with
+                | Some canon -> Some (canon, IPv4)
+                | None -> None
 
             | Some IPv6 ->
                 match Kinds.canonicalIpv6 v with
@@ -258,7 +296,7 @@ module Normalize =
             { Value = value
               Kind = kind
               Sources =
-                  if String.IsNullOrWhiteSpace r.Source then [] 
+                  if String.IsNullOrWhiteSpace r.Source then []
                   else [r.Source.Trim()]
               Tags =
                   r.Tags
@@ -378,9 +416,10 @@ module Parsing =
             }
 
     let parseStixLite (source: string) (path: string) : Result<RawIoc list, ParseError> =
+        // Path segment may itself contain quoted parts, e.g. file:hashes.'SHA-256'.
         let pairRe =
             Regex(
-                @"([A-Za-z0-9_:\-\.]+)\s*=\s*'([^']+)'",
+                @"([A-Za-z0-9_:\-\.']+)\s*=\s*'([^']+)'",
                 RegexOptions.CultureInvariant)
 
         let kindOfPath (objectPath: string) : IocKind option =
@@ -660,7 +699,7 @@ module Whitelist =
             if Kinds.reSha256.IsMatch v then Some v else None
 
         | IPv4 ->
-            if Kinds.isIpv4 value.Trim() then Some (value.Trim()) else None
+            Kinds.canonicalIpv4 value
 
         | IPv6 ->
             Kinds.canonicalIpv6 value
@@ -766,6 +805,8 @@ module Report =
             if not row.Ioc.Tags.IsEmpty then
                 sb.AppendLine(sprintf "  tags    : %s" (String.concat ", " row.Ioc.Tags)) |> ignore
 
+            sb.AppendLine(sprintf "  seen    : %s" (row.Ioc.SeenAt.ToString("o"))) |> ignore
+
             let e = row.Enrichment
             sb.AppendLine(sprintf "  country : %s" (fmtOpt e.GeoCountry)) |> ignore
             sb.AppendLine(sprintf "  city    : %s" (fmtOpt e.GeoCity)) |> ignore
@@ -791,6 +832,7 @@ module Report =
                 "value", JsonValue.String row.Ioc.Value
                 "sources", JsonValue.Array (row.Ioc.Sources |> List.map JsonValue.String |> List.toArray)
                 "tags", JsonValue.Array (row.Ioc.Tags |> List.map JsonValue.String |> List.toArray)
+                "seen_at", JsonValue.String (row.Ioc.SeenAt.ToString("o"))
                 "whitelisted", JsonValue.Boolean row.IsWhitelisted
                 "whitelist_reasons",
                     JsonValue.Array (row.WhitelistReasons |> List.map JsonValue.String |> List.toArray)
@@ -815,9 +857,12 @@ type PipelineConfig = {
 module Pipeline =
 
     type RunDiagnostics = {
-        InputCount       : int
-        NormalizedCount  : int
-        DroppedCount     : int
+        InputCount        : int
+        NormalizedCount   : int
+        DroppedCount      : int
+        /// Number of duplicates removed during deduplication
+        /// (i.e. normalized.Length - deduped.Length).
+        DuplicatesRemoved : int
     }
 
     let runWithDiagnostics
@@ -833,15 +878,21 @@ module Pipeline =
 
         let dropped = rawFeeds.Length - normalized.Length
 
-        let rows =
+        let deduped =
             normalized
             |> Dedup.deduplicate
+
+        let duplicatesRemoved = normalized.Length - deduped.Length
+
+        let rows =
+            deduped
             |> Report.toRows enrich cfg.Whitelist
 
         rows, {
             InputCount = rawFeeds.Length
             NormalizedCount = normalized.Length
             DroppedCount = dropped
+            DuplicatesRemoved = duplicatesRemoved
         }
 
     let run (cfg: PipelineConfig) (rawFeeds: RawIoc list) : ReportRow list =
@@ -953,34 +1004,86 @@ module Demo =
 [<EntryPoint>]
 let main argv =
     let cfg = Demo.buildConfig ()
-    let rows, diagnostics = Pipeline.runWithDiagnostics cfg Demo.rawFeeds
 
-    printfn "%s" (Report.renderText rows)
-
-    printfn
-        "Pipeline: input=%d normalized=%d dropped=%d"
-        diagnostics.InputCount
-        diagnostics.NormalizedCount
-        diagnostics.DroppedCount
-
-    let outPath =
-        if argv.Length > 0 && not (String.IsNullOrWhiteSpace argv.[0]) then
-            argv.[0]
+    // --- CLI: --out <path> for output, positional args are input files. ---
+    let mutable outPath : string option = None
+    let inputs = ResizeArray<string>()
+    let mutable i = 0
+    while i < argv.Length do
+        let a = argv.[i]
+        if a = "--out" then
+            if i + 1 < argv.Length && not (String.IsNullOrWhiteSpace argv.[i + 1]) then
+                outPath <- Some argv.[i + 1]
+                i <- i + 2
+            else
+                eprintfn "Missing value for --out"
+                i <- i + 1
+        elif a.StartsWith "--" then
+            eprintfn "Unknown option: %s" a
+            i <- i + 1
         else
-            Path.Combine(Environment.CurrentDirectory, "report.json")
+            inputs.Add a
+            i <- i + 1
 
-    try
-        let jsonOut = Report.toJson rows
-        File.WriteAllText(outPath, jsonOut.ToString(), Encoding.UTF8)
-        printfn "JSON report written: %s" outPath
-        0
-    with
-    | :? IOException as ex ->
-        eprintfn "Could not write report '%s': %s" outPath ex.Message
+    let parseOne (path: string) : Result<RawIoc list, ParseError> =
+        let name = Path.GetFileName(path).ToLowerInvariant()
+        let ext = Path.GetExtension(path).ToLowerInvariant()
+        if name.Contains "stix" then
+            Parsing.parseStixLite path path
+        else
+            match ext with
+            | ".csv" -> Parsing.parseCsv path path
+            | ".json" -> Parsing.parseJson path path
+            // Fallback: try JSON, that's the safest default for an unknown feed.
+            | _ -> Parsing.parseJson path path
+
+    let rawFeedsResult : Result<RawIoc list, ParseError> =
+        if inputs.Count = 0 then
+            Ok Demo.rawFeeds
+        else
+            inputs
+            |> Seq.fold (fun acc path ->
+                match acc with
+                | Error e -> Error e
+                | Ok xs ->
+                    match parseOne path with
+                    | Ok ys -> Ok (xs @ ys)
+                    | Error e -> Error e) (Ok [])
+
+    match rawFeedsResult with
+    | Error err ->
+        eprintfn "Parse error: source='%s' path='%s' message='%s'"
+            err.Source err.Path err.Message
         1
-    | :? UnauthorizedAccessException as ex ->
-        eprintfn "No permission to write report '%s': %s" outPath ex.Message
-        1
-    | ex ->
-        eprintfn "Could not write report '%s': %s" outPath ex.Message
-        1
+    | Ok rawFeeds ->
+        let rows, diagnostics = Pipeline.runWithDiagnostics cfg rawFeeds
+
+        printfn "%s" (Report.renderText rows)
+
+        printfn
+            "Pipeline: input=%d normalized=%d dropped=%d duplicates_removed=%d"
+            diagnostics.InputCount
+            diagnostics.NormalizedCount
+            diagnostics.DroppedCount
+            diagnostics.DuplicatesRemoved
+
+        let outPath =
+            match outPath with
+            | Some p when not (String.IsNullOrWhiteSpace p) -> p
+            | _ -> Path.Combine(Environment.CurrentDirectory, "report.json")
+
+        try
+            let jsonOut = Report.toJson rows
+            File.WriteAllText(outPath, jsonOut.ToString(), Encoding.UTF8)
+            printfn "JSON report written: %s" outPath
+            0
+        with
+        | :? IOException as ex ->
+            eprintfn "Could not write report '%s': %s" outPath ex.Message
+            1
+        | :? UnauthorizedAccessException as ex ->
+            eprintfn "No permission to write report '%s': %s" outPath ex.Message
+            1
+        | ex ->
+            eprintfn "Could not write report '%s': %s" outPath ex.Message
+            1
