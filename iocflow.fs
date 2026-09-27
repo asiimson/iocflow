@@ -318,6 +318,14 @@ module Parsing =
         try Some (v.AsString())
         with _ -> None
 
+    /// Version-agnostic column lookup for FSharp.Data.CsvRow.
+    /// Works even on versions of FSharp.Data without TryGetColumn.
+    let private tryGetColumn (row: CsvRow) (name: string) : string option =
+        if row.Columns |> Array.exists (fun c -> c = name) then
+            Some (row.GetColumn name)
+        else
+            None
+
     let private parseTags (t: string) : string list =
         if String.IsNullOrWhiteSpace t then []
         else
@@ -332,16 +340,16 @@ module Parsing =
             let rows =
                 CsvFile.Load(path).Rows
                 |> Seq.choose (fun row ->
-                    match row.TryGetColumn "indicator" with
+                    match tryGetColumn row "indicator" with
                     | Some value when not (String.IsNullOrWhiteSpace value) ->
                         let kind =
-                            match row.TryGetColumn "type" with
+                            match tryGetColumn row "type" with
                             | Some t when not (String.IsNullOrWhiteSpace t) ->
                                 Normalize.guessKind t
                             | _ -> None
 
                         let tags =
-                            match row.TryGetColumn "tags" with
+                            match tryGetColumn row "tags" with
                             | Some t -> parseTags t
                             | None -> []
 
@@ -540,7 +548,7 @@ type IWhois =
 
 module Enrich =
 
-    let private emptyEnrichment = {
+    let private emptyEnrichment : Enrichment = {
         GeoCountry = None
         GeoCity = None
         Asn = None
@@ -639,8 +647,9 @@ module Whitelist =
                 elif remainingBits = 0 then true
                 else
                     let mask = byte (0xFF <<< (8 - remainingBits))
-                    (ipBytes.[fullBytes] &&& mask) =
-                    (netBytes.[fullBytes] &&& mask)
+                    let ipByte = ipBytes.[fullBytes] &&& mask
+                    let netByte = netBytes.[fullBytes] &&& mask
+                    ipByte = netByte
             | _ -> false
 
     let private domainMatches (host: string) (suffix: string) =
